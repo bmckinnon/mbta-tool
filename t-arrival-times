@@ -1,0 +1,162 @@
+#!/usr/bin/python
+#
+# Author: Bill McKinnon
+# Date:   2013-02-26
+#
+# Script to print out the current redline trains arrival times for a given destination.
+#
+# NOTES:
+#    See
+#      http://www.mbta.com/uploadedfiles/Description.pdf
+#      (and also more generally http://www.mbta.com/rider_tools/developers/default.asp?id=22393 (related links section) )
+#    ...for more background.
+
+# TODO: Add -l logging option to log things to some preconfigured dir (or take the dir w/the -l). Want to have a
+#       historical log of the raw data pulled, for the heck of it.
+#
+#
+# TODO: Look into commuter rail info that's available, if any
+#
+# TODO: Try to get a visual repr of the schedule, optionally? Maybe something like:
+#
+#           Train xxx    Train yyy   ...
+#
+# Kendall:   6:01       
+# Central:   6:06             
+# Harvard:   6:11          6:13
+#  Porter:   6:16          6:18
+#   Davis:                 6:23
+# Alewife:                 6:28
+#
+#
+#
+#
+#
+
+import sys
+import os
+import argparse
+import urllib2
+import json
+import time
+import datetime
+import pprint
+
+# this 404's now, but the new url has different structure; need to sort out.
+MBTA_JSON_URL_TMPL = 'http://developer.mbta.com/lib/rthr/%s.json' 
+
+# new url w/different json structure (see red-1401227433.json for an example)
+# Oh, looks like it's documented at the same normal url: http://www.mbta.com/rider_tools/developers/default.asp?id=21898;
+# there's a lookup table for platforms, etc.
+#MBTA_JSON_URL_TMPL =  'http://developer.mbta.com/Data/%s.json'
+
+LOG_DATAFILE_DIR = '/home/bill/dev/mbta-thing'
+
+def parseArgs():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-j', dest='jsonfile')
+    parser.add_argument('-D', '--debug', action='store_true')
+    parser.add_argument('-t', '--train', type=str, choices=['red', 'blue', 'orange'], required=True)
+    parser.add_argument('-a', '--all-dests', action='store_true')
+    parser.add_argument('-d', '--dest', type=str, required=False)
+    parser.add_argument('-n', '--not-dest', type=str, required=False)
+    parser.add_argument('-f', '--filter-by-stop', type=str, required=False)
+    parser.add_argument('-l', '--log-datafile', action='store_true')
+    args = parser.parse_args()
+
+    if not args.all_dests and not args.dest and not args.not_dest:
+        sys.exit("Error: Must give a dest; use -a / --all-dests, -d / --dest <dest>, or -n / --not-dest <dest>")
+
+    if args.all_dests and args.dest:
+        sys.exit("Error: Use -a / --all-dests or -d / --dest <dest>, but not both.")
+
+    if args.all_dests and args.not_dest:
+        sys.exit("Error: Use -a / --all-dests or -n / --not-dest <dest>, but not both.")
+    return args
+
+def loadData(args):
+    """Load json data into a python data structure. Use either the normal live url, or, if a file
+       was given with -j, use that instead.
+    """
+    if args.jsonfile:
+        # Use provided json file, if given (useful for testing w/out hammering the remote server
+        fh = file(args.jsonfile)
+    else:
+        url = MBTA_JSON_URL_TMPL % (args.train,)
+        fh = urllib2.urlopen(url)
+    jsonData = fh.read()
+    fh.close()
+
+    if args.log_datafile:
+        fh = open(os.path.join(LOG_DATAFILE_DIR, "%s-%s.json" % (args.train, int(time.time()))), 'w')
+        fh.write(jsonData)
+        fh.close()
+
+    data = json.loads(jsonData)
+    return data
+
+def trainStopTime(train, stop):
+    """Return the time in seconds (int) of the predicted arrival time of a train, given a train
+       data struct.
+    """
+    predsForStop = filter((lambda pred: pred['Stop'].lower() == stop.lower()), train['Predictions'])
+    if not(len(predsForStop)) == 1:
+        sys.exit("trainStopTime(): Couldn't find or found more than one stop for stop %s; exiting." % (stop,))
+    predForStop = predsForStop[0]
+    return int(predForStop['Seconds'])
+
+def displayData(data):
+    # Everything is under here
+    data = data['TripList']
+
+    # Grab some metadata
+    curTime = data['CurrentTime']
+    line    = data['Line']
+
+    # And this has all the train specific stuff. Why it's called trips I'm not quite sure.
+    trains = data['Trips'] 
+
+    print "Current reported time: %s (%d sec differential from local time)" % (time.ctime(curTime), curTime - time.time())
+    print "Line: %s" % (line,)
+    print "Trains: %s" % (len(trains),)
+    print
+
+    if args.filter_by_stop:
+        # If given a stop to filter on, filter trains down to just those with the stop of interest. This culls out
+        # trains that aren't very close to the stop in question yet, or that are already past it.
+        trains = [x for x in trains if len([ y for y in x['Predictions'] if args.filter_by_stop.lower() == y['Stop'].lower() ]) >= 1 ]
+
+        # Then sort them by arrival time of the stop of interest.
+        trains.sort((lambda a,b: cmp(trainStopTime(a, args.filter_by_stop), trainStopTime(b, args.filter_by_stop))))
+
+    for train in trains:
+        dest = train['Destination']
+        if not args.all_dests:
+            # Skip destinations that aren't of interest, if -d <dest> or -n <dest> were given.
+            if args.not_dest:
+                if args.not_dest.lower() == dest.lower():
+                    continue
+            else:
+                if args.dest.lower() != dest.lower():
+                    continue
+        id = train['TripID']
+        print "  Train (trip) id: %s, destination = %s" % (id, dest)
+        for stop in train['Predictions']:
+            predictedArrival = datetime.datetime.fromtimestamp(curTime + stop['Seconds']).strftime("%I:%M %p")
+            minutesAway = stop['Seconds']/60.0
+            print "    %-20s %s (in %4.1f min) [train/trip id %s]" % (stop['Stop'] + ':', predictedArrival, minutesAway, id)
+        print
+
+
+#
+# Mainline code
+#
+args = parseArgs()
+
+data = loadData(args)
+
+if args.debug:
+    pprint.pprint(data)
+    sys.exit(0)
+
+displayData(data)
